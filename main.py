@@ -61,28 +61,57 @@ def parse_instrument(instrument_name, kind='future'):
     Returns:
         dict: A dictionary containing the contract type ('perpetual' or 'futures') and the expiration date (if applicable).
     """
+    parts = instrument_name.split("-")
+    if len(parts) < 2:
+        raise ValueError("Invalid instrument format")
+    symbol = parts[0]
     if "-PERP" in instrument_name:
-        return {"contract_type": "perpetual", "expiration_date": None}
+        return {"symbol": symbol, "contract_type": "perpetual", "expiration_date": None}
 
     try:
         if kind == 'future':
             # For futures contracts, extract expiration date
             # Expected format: SYMBOL-DAYMONYY (e.g., BTC-29MAR24)
-            parts = instrument_name.split("-")
-            if len(parts) != 2:
-                raise ValueError("Invalid instrument format")
-
             date_str = parts[1]  # e.g., "29MAR24"
             expiration_date = datetime.strptime(date_str, "%d%b%y")  # Parse date
             formatted_date = expiration_date.strftime("%Y-%m-%d")
-            return {"contract_type": kind, "expiration_date": formatted_date}
+            return {"symbol": symbol, "contract_type": kind, "expiration_date": formatted_date}
         elif kind == 'option':
             return None
     except Exception as e:
         raise ValueError(f"Failed to parse instrument name '{instrument_name}': {e}")
 
+def get_duration_in_days(expiration_timestamp, creation_timestamp):
+    # Number of milliseconds in one day
+    milliseconds_per_day = 24 * 60 * 60 * 1000
+    # Calculate the duration in days
+    duration_days = (expiration_timestamp - creation_timestamp) / milliseconds_per_day
+    return int(duration_days)
 
-def process_trade_data(trades, kind_value='future'):
+def process_instruments_data(instruments, kind_value: str ='future'):
+    result = []
+    milliseconds_per_day = 24 * 60 * 60 * 1000
+    for instr in instruments:
+        instrument_name = instr['instrument_name']
+        parsed_data = parse_instrument(instrument_name, kind_value)
+        processed_instrument = {
+            'instrument_name': instrument_name,
+            'instrument_id': instr['instrument_id'],
+            'kind': parsed_data["contract_type"],
+            'symbol': instr["base_currency"],
+            'expiration_date': parsed_data["expiration_date"],
+            'expiration_timestamp': instr['expiration_timestamp'],
+            'creation_timestamp': instr['creation_timestamp'],
+            'duration': get_duration_in_days(instr['expiration_timestamp'], instr['creation_timestamp']),
+            'tick_size': instr['tick_size'],
+            'min_trade_amount': instr['min_trade_amount'],
+            'settlement_period': instr['settlement_period'],  # 'week', 'month', 'quarter'
+        }
+        result.append(processed_instrument)
+    return result
+
+
+def process_trade_data(trades, kind_value: str ='future'):
     result = []
     for trade in trades:
         # Determine the value of the 'kind' field
@@ -92,20 +121,56 @@ def process_trade_data(trades, kind_value='future'):
         # Filter and format the fields
         processed_trade = {
             'timestamp': trade['timestamp'],
-            'instrument_name': trade['instrument_name'],
+            'instrument_name': instrument_name,
             'price': trade['price'],
             'mark_price': trade['mark_price'],
             'index_price': trade['index_price'],
             'direction': trade['direction'],
             'amount': trade['amount'],
+            'symbol': parsed_data['symbol'],
             'kind': parsed_data["contract_type"],
             'expiration_date': parsed_data["expiration_date"],
         }
         result.append(processed_trade)
     return result
 
+def get_instruments(currency: str, kind: str, expired: bool = False):
+    assert isinstance(currency, str), "currency must be a string"
+    params = {
+        "currency": currency,
+        "kind": kind,
+        "expired": str(expired).lower(),
+    }
 
-def derivative_data(currency: str, kind: str, start_date: date, end_date: date, count: int = 1000) -> pd.DataFrame:
+    derivative_list = []
+
+    url = 'https://history.deribit.com/api/v2/public/get_instruments'
+
+    with requests.Session() as session:
+        try:
+            response = session.get(url, params=params)
+            response.raise_for_status()
+            response_data = response.json()
+            result = response_data['result']
+
+            if result is None or len(result) == 0:
+                return pd.DataFrame()
+
+        except requests.exceptions.RequestException as e:
+            print(f"Request failed: {e}")
+        except KeyError:
+            print("Unexpected response structure")
+    processed_instruments = process_instruments_data(result, kind_value=kind)
+    derivative_list.extend(processed_instruments)
+
+    if derivative_list is None or len(derivative_list) == 0:
+        print("No trades found for the specified range.")
+        return pd.DataFrame()
+
+    return pd.DataFrame(derivative_list)
+
+
+def get_trade_history(currency: str, kind: str, start_date: date, end_date: date, count: int = 1000) -> pd.DataFrame:
     """Returns derivative trade data for a specified currency and time range.
 
     Args:
@@ -161,7 +226,7 @@ def derivative_data(currency: str, kind: str, start_date: date, end_date: date, 
                 # result = sorted(result, key=lambda res: (res['timestamp'], res['trade_id']))
                 if batch_number == 223:
                     print(result)
-                    # break
+                    break
 
                 # exclude duplicates
                 filtered_result = [
@@ -218,11 +283,19 @@ def derivative_data(currency: str, kind: str, start_date: date, end_date: date, 
 if __name__ == "__main__":
     currency = 'BTC'
     kind = 'future'
+
+    instruments_expired = get_instruments(currency, kind, expired=True)
+    instruments_active = get_instruments(currency, kind, expired=False)
+    instruments = pd.concat([instruments_expired, instruments_active], ignore_index=True)
+    instruments_df = instruments[instruments['duration'] > 300]
+
+    print(instruments_df)
+
     start_date_str = '2024-01-01'
     end_date_str = '2024-01-01'
     start_date: date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
     end_date: date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
 
-    df = derivative_data(currency, 'future', start_date, end_date, count=1000)
+    df = get_trade_history(currency, 'future', start_date, end_date, count=1000)
     print(df.head())
     print(df.tail())
